@@ -178,6 +178,8 @@ async fn process_request(State(pipeline): State<Arc<Pipeline>>, mut body: Multip
         _ => return StatusCode::BAD_REQUEST,
     };
 
+    dbg!(_params);
+
     StatusCode::OK
 }
 
