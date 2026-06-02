@@ -45,20 +45,26 @@ pub enum Transform {
     Blur { sigma: f32 },
 }
 
+pub struct EnqueuedJob {
+    pub id: String,
+    pub source_path: String,
+    pub transform: Transform,
+}
+
 // A job queue with an asynchronous push/pop
 // interface.
 //
 // TODO: Real version with Kafka
 pub struct JobQueue {
-    inner: Mutex<VecDeque<Job>>,
+    inner: Mutex<VecDeque<EnqueuedJob>>,
 }
 
 impl JobQueue {
-    async fn push(&self, job: Job) {
+    async fn push(&self, job: EnqueuedJob) {
         self.inner.lock().await.push_back(job);
     }
 
-    async fn pop(&self) -> Option<Job> {
+    async fn pop(&self) -> Option<EnqueuedJob> {
         self.inner.lock().await.pop_front()
     }
 }
@@ -173,14 +179,27 @@ async fn process_request(State(pipeline): State<Arc<Pipeline>>, mut body: Multip
         }
     }
 
-    let _params = match (image, transform) {
+    let params = match (image, transform) {
         (Some(image), Some(transform)) => RequestParams { image, transform },
         _ => return StatusCode::BAD_REQUEST,
     };
 
-    dbg!(_params);
+    let id = uuid::Uuid::new_v4().to_string();
+    let source_path = format!("uploads/{}", id);
 
-    StatusCode::OK
+    if tokio::fs::write(&source_path, &params.image).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+
+    let enqueued = EnqueuedJob {
+        id: id.clone(),
+        source_path: source_path.clone(),
+        transform: params.transform,
+    };
+
+    pipeline.queue.push(enqueued).await;
+
+    StatusCode::ACCEPTED
 }
 
 #[tokio::main]
