@@ -6,10 +6,11 @@ use axum::{
     extract::{Multipart, State},
     routing::{get, post},
 };
+use image::ImageReader;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use std::sync::Arc;
+use tokio::sync::{Semaphore, mpsc};
 
 use crate::{
     metadata_store::{MetadataStore, NoopMetadataStore},
@@ -51,21 +52,16 @@ pub struct EnqueuedJob {
     pub transform: Transform,
 }
 
-// A job queue with an asynchronous push/pop
-// interface.
+// A job queue with an asynchronous push interface.
 //
 // TODO: Real version with Kafka
 pub struct JobQueue {
-    inner: Mutex<VecDeque<EnqueuedJob>>,
+    tx: mpsc::Sender<EnqueuedJob>,
 }
 
 impl JobQueue {
     async fn push(&self, job: EnqueuedJob) {
-        self.inner.lock().await.push_back(job);
-    }
-
-    async fn pop(&self) -> Option<EnqueuedJob> {
-        self.inner.lock().await.pop_front()
+        let _ = self.tx.send(job).await;
     }
 }
 
@@ -78,36 +74,42 @@ struct Pipeline {
 }
 
 impl Pipeline {
-    // The consumer loop: pull job ids, process each under a concurrency permit.
-    async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<String>) {
-        while let Some(job_id) = rx.recv().await {
+    // The consumer loop: pull enqueued jobs, process each under a concurrency permit.
+    async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<EnqueuedJob>) {
+        while let Some(enqueued) = rx.recv().await {
             let permit = self.permits.clone().acquire_owned().await.unwrap();
-
             let pipeline = self.clone();
-
-            tokio::spawn(async {
-                pipeline.process_job(job_id).await;
+            tokio::spawn(async move {
+                pipeline.process_job(enqueued).await;
                 drop(permit);
             });
         }
     }
 
-    // Upon relaunch, inspect outstanding non-terminal jobs and enqueue them into `tx`.
-    async fn recover(&self, tx: &mpsc::Sender<String>) -> anyhow::Result<()> {
+    // Upon relaunch, re-enqueue any non-terminal jobs found in state.
+    async fn recover(&self) -> anyhow::Result<()> {
         for job in self.state.all().await? {
             if job.state == JobState::Processing || job.state == JobState::Queued {
-                let _ = tx.send(job.id).await; // re-schedule
+                self.queue
+                    .push(EnqueuedJob {
+                        id: job.id,
+                        source_path: job.source_path,
+                        transform: job.transform,
+                    })
+                    .await;
             }
         }
         Ok(())
     }
 
-    async fn process_job(self: Arc<Self>, job_id: String) {
-        let mut job = match self.state.get(&job_id).await {
-            Ok(Some(j)) => j,
-            _ => return, // unknown id; nothing to do
+    async fn process_job(self: Arc<Self>, enqueued: EnqueuedJob) {
+        let mut job = Job {
+            id: enqueued.id,
+            source_path: enqueued.source_path,
+            transform: enqueued.transform,
+            state: JobState::Processing,
+            error: None,
         };
-        job.state = JobState::Processing;
         let _ = self.state.put(&job).await;
 
         let transform = job.transform.clone();
@@ -116,6 +118,8 @@ impl Pipeline {
             do_transform(&source, &transform) // returns Result<output_path>
         })
         .await;
+
+        dbg!(&result);
 
         match result {
             Ok(Ok(output_path)) => {
@@ -138,15 +142,16 @@ impl Pipeline {
 }
 
 fn do_transform(source: &str, transform: &Transform) -> anyhow::Result<String> {
-    let img = image::open(source)?;
+    let image = ImageReader::open(source)?.with_guessed_format()?.decode()?;
+
     let out = match transform {
-        Transform::Grayscale => img.grayscale(),
+        Transform::Grayscale => image.grayscale(),
         Transform::Resize { width, height } => {
-            img.resize_exact(*width, *height, image::imageops::FilterType::Lanczos3)
+            image.resize_exact(*width, *height, image::imageops::FilterType::Lanczos3)
         }
-        Transform::Blur { sigma } => img.blur(*sigma),
+        Transform::Blur { sigma } => image.blur(*sigma),
     };
-    // idempotent output path: deterministic from id/params, overwrite-safe.
+    // TODO: idempotent output path: deterministic from id/params, overwrite-safe.
     let output_path = format!("outputs/{}.png", uuid::Uuid::new_v4());
     out.save(&output_path)?;
     Ok(output_path)
@@ -211,19 +216,17 @@ async fn main() -> anyhow::Result<()> {
     let metadata = Arc::new(NoopMetadataStore);
     let permits = Arc::new(Semaphore::new(max_inflight));
 
-    let queue = Arc::new(JobQueue {
-        inner: Mutex::new(VecDeque::new()),
-    });
+    let (tx, rx) = mpsc::channel::<EnqueuedJob>(QUEUE_CAPACITY);
+    let queue = Arc::new(JobQueue { tx });
     let pipeline = Arc::new(Pipeline {
         state,
         metadata,
         queue,
         permits,
     });
-    let (tx, rx) = mpsc::channel::<String>(QUEUE_CAPACITY);
 
     // Recover before serving
-    pipeline.recover(&tx).await?;
+    pipeline.recover().await?;
 
     // Start the worker pool
     tokio::spawn(pipeline.clone().run(rx));
