@@ -3,10 +3,11 @@ mod state_store;
 
 use axum::{
     Json, Router,
-    extract::Multipart,
+    extract::{Multipart, State},
     routing::{get, post},
 };
 use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
 use std::{collections::VecDeque, sync::Arc};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
@@ -65,6 +66,7 @@ impl JobQueue {
 struct Pipeline {
     state: Arc<InMemoryStateStore>,
     metadata: Arc<NoopMetadataStore>,
+    queue: Arc<JobQueue>,
     // bounds concurrent in-flight (decoded) images -> bounds memory
     permits: Arc<Semaphore>,
 }
@@ -144,21 +146,37 @@ fn do_transform(source: &str, transform: &Transform) -> anyhow::Result<String> {
     Ok(output_path)
 }
 
-async fn process_request(
-    // Json(payload): Json<serde_json::Value>,
-    mut body: Multipart,
-) -> StatusCode {
-    while let Ok(field) = body.next_field().await {
-        match field {
-            None => return StatusCode::OK,
-            Some(field) => {
-                let name = field.name();
-                dbg!(name);
-                let bytes = field.bytes().await;
-                dbg!(bytes);
-            }
+#[derive(Debug, Clone)]
+struct RequestParams {
+    transform: Transform,
+    image: Vec<u8>,
+}
+
+async fn process_request(State(pipeline): State<Arc<Pipeline>>, mut body: Multipart) -> StatusCode {
+    let mut image: Option<Vec<u8>> = None;
+    let mut transform: Option<Transform> = None;
+
+    while let Ok(Some(field)) = body.next_field().await {
+        match field.name() {
+            Some("image") => match field.bytes().await {
+                Ok(b) => image = Some(b.to_vec()),
+                Err(_) => return StatusCode::BAD_REQUEST,
+            },
+            Some("transform") => match field.bytes().await {
+                Ok(b) => match serde_json::from_slice::<Transform>(&b) {
+                    Ok(t) => transform = Some(t),
+                    Err(_) => return StatusCode::BAD_REQUEST,
+                },
+                Err(_) => return StatusCode::BAD_REQUEST,
+            },
+            _ => {}
         }
     }
+
+    let _params = match (image, transform) {
+        (Some(image), Some(transform)) => RequestParams { image, transform },
+        _ => return StatusCode::BAD_REQUEST,
+    };
 
     StatusCode::OK
 }
@@ -172,9 +190,13 @@ async fn main() -> anyhow::Result<()> {
     let metadata = Arc::new(NoopMetadataStore);
     let permits = Arc::new(Semaphore::new(max_inflight));
 
+    let queue = Arc::new(JobQueue {
+        inner: Mutex::new(VecDeque::new()),
+    });
     let pipeline = Arc::new(Pipeline {
         state,
         metadata,
+        queue,
         permits,
     });
     let (tx, rx) = mpsc::channel::<String>(QUEUE_CAPACITY);
@@ -187,7 +209,8 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(|| async { "Hello, World!" }))
-        .route("/enqueue", post(process_request));
+        .route("/enqueue", post(process_request))
+        .with_state(pipeline);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
